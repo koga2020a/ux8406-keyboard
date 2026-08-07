@@ -8,6 +8,11 @@ Persistent
 ;
 ; Hotkey:
 ;   Shift + Ctrl + Esc  -> Fn Lock ON/OFF toggle
+;     (ホットキーは FNLOCK_HOTKEY 変数で変更可能)
+;
+; キーリマップ:
+;   CapsLock            -> Ctrl (CapsLock+C = Ctrl+C など組み合わせも可)
+;   Win + CapsLock      -> 本来のCapsLock ON/OFF トグル
 ;
 ; 実機確認済み:
 ;   VID         = 0x0B05
@@ -25,7 +30,16 @@ Persistent
 ;   1) 対象HIDを自動検出
 ;   2) "ASUS Tech.Inc." 初期化Feature Reportを送信
 ;   3) Fn LockをONにして既知状態へ揃える
+;   (見つからない場合はMsgBoxを出さずバックグラウンドでリトライ)
+;
+; Bluetooth再接続 / スリープ復帰:
+;   WM_DEVICECHANGE / WM_POWERBROADCAST を受けて自動で再適用
 ; =====================================================================
+
+; ---------------------------------------------------------------------
+; 設定
+; ---------------------------------------------------------------------
+global FNLOCK_HOTKEY     := "^+Esc"
 
 global ASUS_VID          := 0x0B05
 global UX8406_BT_PID     := 0x1B2D
@@ -34,51 +48,146 @@ global TARGET_USAGE      := 0x0076
 global TARGET_REPORT_ID  := 0x5A
 global TARGET_FEATURELEN := 16
 
+; ---------------------------------------------------------------------
+; 状態
+; ---------------------------------------------------------------------
 global TargetPath := ""
+
+; 接続ごとに1回だけ初期化ハンドシェイクを送るための記録
+global InitializedPath := ""
+
 global FnLocked := true
+global DeviceReady := false
+global FirstApplyDone := false
 
-; 起動時にONへ揃える
-try {
-    TargetPath := FindTargetPath()
+; ---------------------------------------------------------------------
+; トレイメニュー
+; ---------------------------------------------------------------------
+A_TrayMenu.Insert("1&", "Fn Lock切り替え", ToggleFnLock)
+A_TrayMenu.Default := "Fn Lock切り替え"
+UpdateTrayTip()
 
-    if (TargetPath = "")
-        throw Error("UX8406 Bluetoothキーボードの制御用HIDが見つかりません。")
+; ---------------------------------------------------------------------
+; ホットキー登録
+; ---------------------------------------------------------------------
+Hotkey(FNLOCK_HOTKEY, ToggleFnLock)
 
-    if !InitializeAndSetFnLock(true)
-        throw Error("起動時のFn Lock ON送信に失敗しました。")
+; ---------------------------------------------------------------------
+; Bluetooth再接続 / スリープ復帰の検知
+; ---------------------------------------------------------------------
+OnMessage(0x219, OnDeviceChange)     ; WM_DEVICECHANGE
+OnMessage(0x218, OnPowerBroadcast)   ; WM_POWERBROADCAST
 
-    ShowFnTooltip(true)
-}
-catch as e {
-    MsgBox(
-        "ASUS Fn Lock初期化エラー:`n`n" e.Message,
-        "ASUS UX8406 Fn Lock",
-        "Iconx"
-    )
-}
+; ---------------------------------------------------------------------
+; 起動時にONへ揃える(失敗時はMsgBoxを出さずリトライ)
+; ---------------------------------------------------------------------
+FnLocked := true
+ReapplyFnLock()
 
 
 ; =====================================================================
-; Shift + Ctrl + Esc
+; Fn Lockトグル (ホットキー / トレイメニュー共通)
 ; =====================================================================
 
-^+Esc::
+ToggleFnLock(*)
 {
     global FnLocked
+    global DeviceReady
 
     newState := !FnLocked
 
     try {
         if InitializeAndSetFnLock(newState) {
             FnLocked := newState
+            DeviceReady := true
+            UpdateTrayTip()
             ShowFnTooltip(FnLocked)
         } else {
+            DeviceReady := false
+            UpdateTrayTip()
             ShowErrorTooltip("Fn Lock送信失敗")
         }
     }
     catch as e {
-        ShowErrorTooltip("Fn Lock送信失敗")
+        DeviceReady := false
+        UpdateTrayTip()
+        ShowErrorTooltip("Fn Lock送信失敗: " e.Message)
     }
+}
+
+
+; =====================================================================
+; 自動再適用 (Bluetooth再接続 / スリープ復帰 / 起動時リトライ)
+; =====================================================================
+
+OnDeviceChange(wParam, lParam, msg, hwnd)
+{
+    static DBT_DEVNODES_CHANGED := 0x0007
+
+    if (wParam = DBT_DEVNODES_CHANGED)
+        SetTimer(ReapplyFnLock, -1500)
+}
+
+
+OnPowerBroadcast(wParam, lParam, msg, hwnd)
+{
+    static PBT_APMRESUMESUSPEND := 0x7
+    static PBT_APMRESUMEAUTOMATIC := 0x12
+
+    if (wParam = PBT_APMRESUMEAUTOMATIC || wParam = PBT_APMRESUMESUSPEND)
+        SetTimer(ReapplyFnLock, -3000)
+}
+
+
+ReapplyFnLock()
+{
+    global FnLocked
+    global DeviceReady
+    global InitializedPath
+    global FirstApplyDone
+
+    ; 再接続後はデバイス側がリセットされている可能性があるため、
+    ; このパスでは必ず初期化ハンドシェイクを再送する
+    InitializedPath := ""
+
+    ok := false
+
+    try {
+        ok := InitializeAndSetFnLock(FnLocked)
+    }
+    catch {
+        ok := false
+    }
+
+    DeviceReady := ok
+    UpdateTrayTip()
+
+    ; 自動再適用ではツールチップを出さない(初回成功時のみ通知)
+    if (ok) {
+        if !FirstApplyDone {
+            FirstApplyDone := true
+            ShowFnTooltip(FnLocked)
+        }
+        return
+    }
+
+    ; -付き一発タイマーなので多重スケジュールにならない
+    SetTimer(ReapplyFnLock, FirstApplyDone ? -5000 : -3000)
+}
+
+
+; =====================================================================
+; トレイ表示
+; =====================================================================
+
+UpdateTrayTip()
+{
+    global FnLocked
+    global DeviceReady
+
+    A_IconTip := "UX8406 Fn Lock: "
+        . (FnLocked ? "ON" : "OFF")
+        . (DeviceReady ? "" : " (未接続)")
 }
 
 
@@ -89,6 +198,7 @@ catch as e {
 InitializeAndSetFnLock(enabled)
 {
     global TargetPath
+    global InitializedPath
 
     ; Bluetooth再接続等でPathが無効になった場合に備え、まず現在Pathを試す
     if (TargetPath != "") {
@@ -101,18 +211,24 @@ InitializeAndSetFnLock(enabled)
                 DllCall("kernel32\CloseHandle", "Ptr", h)
             }
         }
+
+        ; オープン失敗 = 切断された可能性。ハンドシェイク状態を無効化
+        InitializedPath := ""
     }
 
     ; 再検出
     TargetPath := FindTargetPath()
+    InitializedPath := ""
 
     if (TargetPath = "")
         return false
 
     h := OpenForFeature(TargetPath)
 
-    if (h = -1)
+    if (h = -1) {
+        InitializedPath := ""
         return false
+    }
 
     try {
         return SendSequence(h, enabled)
@@ -126,22 +242,28 @@ InitializeAndSetFnLock(enabled)
 SendSequence(h, enabled)
 {
     global TARGET_FEATURELEN
+    global TargetPath
+    global InitializedPath
 
     ; -------------------------------------------------------------
-    ; 1) ASUS HID初期化
+    ; 1) ASUS HID初期化 (接続ごとに1回だけ)
     ;    5A + ASCII "ASUS Tech.Inc."
     ; -------------------------------------------------------------
-    init := Buffer(TARGET_FEATURELEN, 0)
-    NumPut("UChar", 0x5A, init, 0)
+    if (TargetPath != InitializedPath) {
+        init := Buffer(TARGET_FEATURELEN, 0)
+        NumPut("UChar", 0x5A, init, 0)
 
-    ascii := "ASUS Tech.Inc."
-    Loop Parse ascii
-        NumPut("UChar", Ord(A_LoopField), init, A_Index)
+        ascii := "ASUS Tech.Inc."
+        Loop Parse ascii
+            NumPut("UChar", Ord(A_LoopField), init, A_Index)
 
-    if !SetFeature(h, init)
-        return false
+        if !SetFeature(h, init)
+            return false
 
-    Sleep 50
+        Sleep 50
+
+        InitializedPath := TargetPath
+    }
 
     ; -------------------------------------------------------------
     ; 2) Fn Lock
@@ -214,7 +336,6 @@ FindTargetPath()
 
     static DIGCF_PRESENT := 0x00000002
     static DIGCF_DEVICEINTERFACE := 0x00000010
-    static ERROR_NO_MORE_ITEMS := 259
 
     hidGuid := Buffer(16, 0)
     DllCall("hid\HidD_GetHidGuid", "Ptr", hidGuid.Ptr)
@@ -250,12 +371,11 @@ FindTargetPath()
                 "Int"
             )
 
-            if !ok {
-                if (A_LastError = ERROR_NO_MORE_ITEMS)
-                    break
-                idx++
-                continue
-            }
+            ; 列挙終了(ERROR_NO_MORE_ITEMS)も想定外エラーも打ち切る
+            ; (idx++ で継続すると無限ループになり得るため)
+            if !ok
+                break
+
 
             required := 0
 
@@ -318,21 +438,26 @@ FindTargetPath()
 }
 
 
+HidInfoInvalid(vid := 0, pid := 0)
+{
+    return {
+        Valid: false,
+        VID: vid,
+        PID: pid,
+        UsagePage: 0,
+        Usage: 0,
+        FeatureLen: 0,
+        FeatureIDs: []
+    }
+}
+
+
 QueryHid(path)
 {
     h := OpenMetadata(path)
 
-    if (h = -1) {
-        return {
-            Valid: false,
-            VID: 0,
-            PID: 0,
-            UsagePage: 0,
-            Usage: 0,
-            FeatureLen: 0,
-            FeatureIDs: []
-        }
-    }
+    if (h = -1)
+        return HidInfoInvalid()
 
     try {
         attrs := Buffer(12, 0)
@@ -343,17 +468,8 @@ QueryHid(path)
             "Ptr", h,
             "Ptr", attrs.Ptr,
             "UChar"
-        ) {
-            return {
-                Valid: false,
-                VID: 0,
-                PID: 0,
-                UsagePage: 0,
-                Usage: 0,
-                FeatureLen: 0,
-                FeatureIDs: []
-            }
-        }
+        )
+            return HidInfoInvalid()
 
         vid := NumGet(attrs, 4, "UShort")
         pid := NumGet(attrs, 6, "UShort")
@@ -365,17 +481,8 @@ QueryHid(path)
             "Ptr", h,
             "Ptr*", &ppd,
             "UChar"
-        ) {
-            return {
-                Valid: false,
-                VID: vid,
-                PID: pid,
-                UsagePage: 0,
-                Usage: 0,
-                FeatureLen: 0,
-                FeatureIDs: []
-            }
-        }
+        )
+            return HidInfoInvalid(vid, pid)
 
         try {
             caps := Buffer(64, 0)
@@ -387,17 +494,8 @@ QueryHid(path)
                 "UInt"
             )
 
-            if (status != 0x00110000) {
-                return {
-                    Valid: false,
-                    VID: vid,
-                    PID: pid,
-                    UsagePage: 0,
-                    Usage: 0,
-                    FeatureLen: 0,
-                    FeatureIDs: []
-                }
-            }
+            if (status != 0x00110000)
+                return HidInfoInvalid(vid, pid)
 
             usage := NumGet(caps, 0, "UShort")
             usagePage := NumGet(caps, 2, "UShort")
@@ -578,3 +676,12 @@ OpenForFeature(path)
         "Ptr"
     )
 }
+
+
+; =====================================================================
+; CapsLock -> Ctrl (組み合わせ対応: CapsLock+C = Ctrl+C など)
+; =====================================================================
+CapsLock::Ctrl
+
+; Win+CapsLock で本来のCapsLockをトグル
+#CapsLock::SetCapsLockState(!GetKeyState("CapsLock", "T"))
