@@ -2,7 +2,7 @@
 
 `asus_ux8406_fnlock_toggle_shift_ctrl_esc.ahk` の実装と、ASUS Zenbook Duo UX8406 付属キーボードの HID プロトコル調査結果をまとめます。
 
-利用方法は [../README.md](../README.md) を参照してください。
+利用方法は [../README.md](../README.md) を参照してください。プロトコル特定に至るまでの試行錯誤の生ログは [`../経緯.txt`](../経緯.txt) にあります。
 
 ## 1. 対象デバイスの HID 情報
 
@@ -18,7 +18,7 @@
 | FeatureReportByteLength | `16` | Report ID 1 バイトを含む |
 | Report ID | `0x5A` | |
 
-キーボードは複数の HID インターフェース(コレクション)を公開しており、制御用インターフェースは上記の UsagePage / Usage / FeatureLen / Report ID の組み合わせで一意に特定できます。
+実機は UX8406**MA**(2024年モデル)。キーボードは複数の HID インターフェース(コレクション)を公開しており、制御用インターフェースは Bluetooth 側 PID `0x1B2D` の **COL05** です。スクリプトはコレクション番号ではなく、上記の UsagePage / Usage / FeatureLen / Report ID の組み合わせで一意に特定します。
 
 USB 接続時(PID `0x1B2C`)については、制御用インターフェースの有無・挙動を確認していないため **未検証** です。スクリプトは Bluetooth 側の PID `0x1B2D` のみを検索対象としています。
 
@@ -51,6 +51,16 @@ Fn Lock コマンドを受け付けさせる前に、以下の Feature Report �
 | --- | --- |
 | Fn Lock ON | `5A D0 4E 01 00 ... 00` |
 | Fn Lock OFF | `5A D0 4E 00 00 ... 00` |
+
+### 2.3 出典・確定の経緯
+
+コマンド `5A D0 4E xx` は独自に発見したものではなく、以下を参考にしています(詳細な試行錯誤は [`../経緯.txt`](../経緯.txt) 参照)。
+
+- **Linux `hid-asus` ドライバ**: Fn Lock 有効化として `5A D0 4E 01` を送信する実装がある。
+- **USB キャプチャの実機報告**: `01` = enable / `00` = disable。
+- **G-Helper**(ASUS 製ユーティリティの OSS 代替): Fn Lock 切り替え時に **ACPI 設定 + 上記 HID 送信の両方** を行う。本スクリプトは HID 送信のみだが、UX8406MA の Bluetooth キーボードに対しては **HID 送信だけで Fn Lock が切り替わることを実機で確認済み**(初回の試行で `00` を送って「効かない」と誤認しかけたが、`01` で F1 が通常の F1 として動作し確定)。
+
+なお G-Helper には「UX8406CA では ASUS サービス(ASUS Optimization 等)を止めると Fn キー自体が効かなくなる」という報告があり、機種・構成によっては ASUS サービスが Fn キー処理に介在する可能性があります。本環境では HID 直接送信のみで動作しています。
 
 ## 3. スクリプトのアーキテクチャ
 
@@ -167,7 +177,12 @@ pnputil /enable-device  "HID\VID_0B05&PID_1B2C&MI_05&COL02\..."
 
 Windows 標準の設定(トグル + 「マウスの接続時にタッチパッドをオンのままにする」)で用途を満たせたため、スクリプト化は見送りました。
 
-## 5. 開発メモ
+## 5. 既知の制限と今後のアイデア
+
+- **キーボード側の Fn+Esc との同期**: キーボード本体の Fn+Esc(ハードウェアの Fn Lock 切り替え)は、機種によっては ASUS サービス経由で処理されるとの報告がある。ユーザーが Fn+Esc を直接押した場合、本スクリプトの内部状態(`FnLocked`)と実機の状態がズレる可能性がある(**未検証**)。
+- 同期を実装するなら、制御用と同じ COL05 の Input Report(InputLen = 6 バイト)を Raw Input(`WM_INPUT`)で監視し、Fn+Esc 押下時に届くバイト列を特定して内部状態を追従させる案がある(未実装。AutoHotkey v2 のみで実現可能な見込み)。
+
+## 6. 開発メモ
 
 構文チェックは AutoHotkey v2 本体の `/validate` で行えます。
 
