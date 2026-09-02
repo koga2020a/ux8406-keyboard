@@ -34,6 +34,15 @@ Persistent
 ;
 ; Bluetooth再接続 / スリープ復帰:
 ;   WM_DEVICECHANGE / WM_POWERBROADCAST を受けて自動で再適用
+;
+; ズレ検知:
+;   周期的にFeature Reportを読み戻し、期待値 5A D0 4E xx と一致しなければ
+;   他ソフトの書き込み / デバイスリセットによる「ズレ」とみなし、
+;   初期化ハンドシェイク込みで再適用してツールチップで通知する
+;   (トレイメニュー「今すぐ再同期」で手動実行も可能)
+;
+;   DRIFT_CHECK_INTERVAL_MS : 読み戻しによるズレ検知の周期(ms) / 0で無効
+;   NOTIFY_ON_AUTOFIX       : 自動修正時にツールチップで通知するか
 ; =====================================================================
 
 ; ---------------------------------------------------------------------
@@ -48,6 +57,11 @@ global TARGET_USAGE      := 0x0076
 global TARGET_REPORT_ID  := 0x5A
 global TARGET_FEATURELEN := 16
 
+; ズレ検知: 実機のFeature Reportを読み戻し、期待値と違えば再適用する周期(ms)。0で無効
+global DRIFT_CHECK_INTERVAL_MS := 10000
+; ズレを自動修正したときにツールチップで通知するか
+global NOTIFY_ON_AUTOFIX := true
+
 ; ---------------------------------------------------------------------
 ; 状態
 ; ---------------------------------------------------------------------
@@ -60,10 +74,15 @@ global FnLocked := true
 global DeviceReady := false
 global FirstApplyDone := false
 
+global LinkDown := false        ; 直近のズレ検知でデバイスに到達できなかった
+global AutoFixCount := 0        ; ズレを検知して自動修正した回数
+global LastAutoFixTime := ""    ; 最後に自動修正した時刻 (HH:mm:ss)
+
 ; ---------------------------------------------------------------------
 ; トレイメニュー
 ; ---------------------------------------------------------------------
 A_TrayMenu.Insert("1&", "Fn Lock切り替え", ToggleFnLock)
+A_TrayMenu.Insert("2&", "今すぐ再同期", ManualResync)
 A_TrayMenu.Default := "Fn Lock切り替え"
 UpdateTrayTip()
 
@@ -84,6 +103,12 @@ OnMessage(0x218, OnPowerBroadcast)   ; WM_POWERBROADCAST
 FnLocked := true
 ReapplyFnLock()
 
+; ---------------------------------------------------------------------
+; ズレ検知の周期チェック開始
+; ---------------------------------------------------------------------
+if (DRIFT_CHECK_INTERVAL_MS > 0)
+    SetTimer(CheckFnLockDrift, DRIFT_CHECK_INTERVAL_MS)
+
 
 ; =====================================================================
 ; Fn Lockトグル (ホットキー / トレイメニュー共通)
@@ -93,6 +118,9 @@ ToggleFnLock(*)
 {
     global FnLocked
     global DeviceReady
+
+    ; ズレ検知タイマー等とのHID送受信の交錯を防ぐ
+    Critical
 
     newState := !FnLocked
 
@@ -145,6 +173,10 @@ ReapplyFnLock()
     global DeviceReady
     global InitializedPath
     global FirstApplyDone
+    global DRIFT_CHECK_INTERVAL_MS
+
+    ; ズレ検知タイマー等とのHID送受信の交錯を防ぐ
+    Critical
 
     ; 再接続後はデバイス側がリセットされている可能性があるため、
     ; このパスでは必ず初期化ハンドシェイクを再送する
@@ -164,6 +196,10 @@ ReapplyFnLock()
 
     ; 自動再適用ではツールチップを出さない(初回成功時のみ通知)
     if (ok) {
+        ; 再接続直後に他ソフトが上書きしてくるケースを早期に拾う
+        if (DRIFT_CHECK_INTERVAL_MS > 0)
+            SetTimer(CheckFnLockDriftSoon, -3000)
+
         if !FirstApplyDone {
             FirstApplyDone := true
             ShowFnTooltip(FnLocked)
@@ -184,10 +220,13 @@ UpdateTrayTip()
 {
     global FnLocked
     global DeviceReady
+    global AutoFixCount
+    global LastAutoFixTime
 
     A_IconTip := "UX8406 Fn Lock: "
         . (FnLocked ? "ON" : "OFF")
         . (DeviceReady ? "" : " (未接続)")
+        . (AutoFixCount > 0 ? " / 自動修正 " AutoFixCount "回 (最終 " LastAutoFixTime ")" : "")
 }
 
 
@@ -197,20 +236,33 @@ UpdateTrayTip()
 
 InitializeAndSetFnLock(enabled)
 {
+    h := OpenTargetHandle()
+
+    if (h = -1)
+        return false
+
+    try {
+        return SendSequence(h, enabled)
+    }
+    finally {
+        DllCall("kernel32\CloseHandle", "Ptr", h)
+    }
+}
+
+
+; 対象HIDのハンドルを取得する (失敗時は -1)
+;   既知のTargetPathをまず試し、駄目なら再検出してから開く
+;   成功時のCloseHandleは呼び出し側の責任 (try/finally)
+OpenTargetHandle()
+{
     global TargetPath
     global InitializedPath
 
     ; Bluetooth再接続等でPathが無効になった場合に備え、まず現在Pathを試す
     if (TargetPath != "") {
         h := OpenForFeature(TargetPath)
-        if (h != -1) {
-            try {
-                return SendSequence(h, enabled)
-            }
-            finally {
-                DllCall("kernel32\CloseHandle", "Ptr", h)
-            }
-        }
+        if (h != -1)
+            return h
 
         ; オープン失敗 = 切断された可能性。ハンドシェイク状態を無効化
         InitializedPath := ""
@@ -221,21 +273,16 @@ InitializeAndSetFnLock(enabled)
     InitializedPath := ""
 
     if (TargetPath = "")
-        return false
+        return -1
 
     h := OpenForFeature(TargetPath)
 
     if (h = -1) {
         InitializedPath := ""
-        return false
+        return -1
     }
 
-    try {
-        return SendSequence(h, enabled)
-    }
-    finally {
-        DllCall("kernel32\CloseHandle", "Ptr", h)
-    }
+    return h
 }
 
 
@@ -277,7 +324,36 @@ SendSequence(h, enabled)
     NumPut("UChar", 0x4E, report, 2)
     NumPut("UChar", enabled ? 0x01 : 0x00, report, 3)
 
-    return SetFeature(h, report)
+    if !SetFeature(h, report)
+        return false
+
+    ; -------------------------------------------------------------
+    ; 3) 読み戻して検証
+    ;    対象コレクションは最後にSetFeatureされた16バイトをそのまま返す
+    ;    GetFeature自体が失敗する環境では検証不能とみなして成功扱い
+    ; -------------------------------------------------------------
+    Sleep 50
+
+    rb := ReadFnLockReport(h)
+
+    if !IsObject(rb)
+        return true
+
+    if ReportIsFnLock(rb, enabled)
+        return true
+
+    ; 不一致なら1回だけ再送
+    if !SetFeature(h, report)
+        return false
+
+    Sleep 50
+
+    rb := ReadFnLockReport(h)
+
+    if !IsObject(rb)
+        return true
+
+    return ReportIsFnLock(rb, enabled)
 }
 
 
@@ -297,6 +373,219 @@ SetFeature(h, report)
 }
 
 
+; SetFeature()と対になる薄いラッパ
+;   呼び出し前にreportの先頭バイトへReport ID (0x5A) を入れておくこと
+GetFeature(h, report)
+{
+    DllCall("kernel32\SetLastError", "UInt", 0)
+
+    ok := DllCall(
+        "hid\HidD_GetFeature",
+        "Ptr", h,
+        "Ptr", report.Ptr,
+        "UInt", report.Size,
+        "UChar"
+    )
+
+    return !!ok
+}
+
+
+; =====================================================================
+; Feature Report読み戻し / ズレ判定
+; =====================================================================
+
+; 現在のFeature Reportを読み戻す
+;   成功時はBuffer、失敗時は "" を返す
+ReadFnLockReport(h)
+{
+    global TARGET_FEATURELEN
+    global TARGET_REPORT_ID
+
+    buf := Buffer(TARGET_FEATURELEN, 0)
+    NumPut("UChar", TARGET_REPORT_ID, buf, 0)
+
+    if !GetFeature(h, buf)
+        return ""
+
+    return buf
+}
+
+
+; 読み戻したレポートからFn Lock状態を取り出す
+;   先頭3バイトが 5A D0 4E なら4バイト目 (0/1) を返す
+;   それ以外は -1 (= Fn Lockレポートではない:
+;   ハンドシェイクのエコー / 他ソフトの書き込み / 初期値など)
+FnLockStateFromReport(buf)
+{
+    if !IsObject(buf)
+        return -1
+
+    if (NumGet(buf, 0, "UChar") != 0x5A)
+        return -1
+
+    if (NumGet(buf, 1, "UChar") != 0xD0)
+        return -1
+
+    if (NumGet(buf, 2, "UChar") != 0x4E)
+        return -1
+
+    return NumGet(buf, 3, "UChar")
+}
+
+
+ReportIsFnLock(buf, enabled)
+{
+    return FnLockStateFromReport(buf) = (enabled ? 1 : 0)
+}
+
+
+; =====================================================================
+; ズレ検知 (周期チェック / 手動再同期)
+; =====================================================================
+
+CheckFnLockDrift()
+{
+    global FnLocked
+    global DeviceReady
+    global InitializedPath
+    global LinkDown
+    global AutoFixCount
+    global LastAutoFixTime
+    global NOTIFY_ON_AUTOFIX
+
+    ; ホットキーや他タイマーとのHID送受信の交錯を防ぐ
+    Critical
+
+    h := OpenTargetHandle()
+
+    ; 未接続。再検出は次回の周期に任せる
+    if (h = -1) {
+        LinkDown := true
+        DeviceReady := false
+        InitializedPath := ""
+        UpdateTrayTip()
+        return
+    }
+
+    rb := ""
+
+    try {
+        rb := ReadFnLockReport(h)
+    }
+    finally {
+        DllCall("kernel32\CloseHandle", "Ptr", h)
+    }
+
+    ; ノードはあるがリンク断などでGetFeatureに失敗 = 未接続扱い
+    if !IsObject(rb) {
+        LinkDown := true
+        DeviceReady := false
+        InitializedPath := ""
+        UpdateTrayTip()
+        return
+    }
+
+    wasDown := LinkDown
+    LinkDown := false
+
+    ; -------------------------------------------------------------
+    ; 期待値と一致
+    ; -------------------------------------------------------------
+    if ReportIsFnLock(rb, FnLocked) {
+        if (wasDown) {
+            ; 再接続直後。レジスタが残っていても念のため
+            ; ハンドシェイク込みで再適用する (通知なし)
+            InitializedPath := ""
+
+            ok := false
+
+            try {
+                ok := InitializeAndSetFnLock(FnLocked)
+            }
+            catch {
+                ok := false
+            }
+
+            DeviceReady := ok
+        } else {
+            DeviceReady := true
+        }
+
+        UpdateTrayTip()
+        return
+    }
+
+    ; -------------------------------------------------------------
+    ; 不一致 = 他者の書き込み / デバイスリセットによるズレ
+    ; -------------------------------------------------------------
+    InitializedPath := ""
+
+    ok := false
+
+    try {
+        ok := InitializeAndSetFnLock(FnLocked)
+    }
+    catch {
+        ok := false
+    }
+
+    DeviceReady := ok
+
+    if (ok) {
+        AutoFixCount++
+        LastAutoFixTime := FormatTime(, "HH:mm:ss")
+
+        if NOTIFY_ON_AUTOFIX
+            ShowAutoFixTooltip(FnLocked, rb)
+    }
+
+    UpdateTrayTip()
+}
+
+
+; 単発の遅延チェック用ラッパ
+;   SetTimer(CheckFnLockDrift, -3000) と書くと同名タイマーの周期設定が
+;   上書きされて周期チェックが止まるため、別関数として登録する
+CheckFnLockDriftSoon()
+{
+    CheckFnLockDrift()
+}
+
+
+; トレイメニュー「今すぐ再同期」
+ManualResync(*)
+{
+    global FnLocked
+    global DeviceReady
+    global InitializedPath
+
+    ; ズレ検知タイマー等とのHID送受信の交錯を防ぐ
+    Critical
+
+    InitializedPath := ""
+
+    ok := false
+
+    try {
+        ok := InitializeAndSetFnLock(FnLocked)
+    }
+    catch {
+        ok := false
+    }
+
+    if (ok) {
+        DeviceReady := true
+        UpdateTrayTip()
+        ShowFnTooltip(FnLocked)
+    } else {
+        DeviceReady := false
+        UpdateTrayTip()
+        ShowErrorTooltip("Fn Lock送信失敗")
+    }
+}
+
+
 ; =====================================================================
 ; Tooltip
 ; =====================================================================
@@ -311,6 +600,20 @@ ShowFnTooltip(enabled)
 ShowErrorTooltip(text)
 {
     ToolTip(text)
+    SetTimer(HideFnTooltip, -1800)
+}
+
+
+ShowAutoFixTooltip(enabled, rb)
+{
+    state := FnLockStateFromReport(rb)
+
+    ; 0/1 = Fn Lockレポートだが値が反対 / -1 = Fn Lockレポートではない
+    if (state = 0 || state = 1)
+        ToolTip("Fn Lock ズレ検知: " (enabled ? "OFF → ON" : "ON → OFF") " に修正")
+    else
+        ToolTip("Fn Lock リセット検知: " (enabled ? "ON" : "OFF") " を再適用")
+
     SetTimer(HideFnTooltip, -1800)
 }
 
